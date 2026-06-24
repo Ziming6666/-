@@ -1,173 +1,144 @@
 #!/usr/bin/env python3
 """
-学生成绩查询系统 - 流式 API 代理服务器
+学生成绩查询系统 - FastAPI 服务器
+提供静态文件服务 + Dify 流式 API 代理
 """
 
 import json
 import os
-import http.client
-from http.server import HTTPServer, SimpleHTTPRequestHandler
+import httpx
 from pathlib import Path
+from fastapi import FastAPI, Request
+from fastapi.responses import StreamingResponse, FileResponse, JSONResponse
+from fastapi.middleware.cors import CORSMiddleware
 
-PORT = 8080
+PORT = int(os.getenv("PORT", "8080"))
 BASE_DIR = Path(__file__).parent
 
-DIFY_HOST = "localhost"
-DIFY_PORT = 80
-DIFY_API_KEY = "app-BxWcOSgIOr23D54hVFOiMCGy"
+# Dify 配置 — 优先从环境变量读取（方便云部署）
+DIFY_HOST = os.getenv("DIFY_HOST", "localhost")
+DIFY_PORT = os.getenv("DIFY_PORT", "80")
+DIFY_API_KEY = os.getenv("DIFY_API_KEY", "app-BxWcOSgIOr23D54hVFOiMCGy")
+DIFY_BASE = os.getenv("DIFY_BASE_URL", f"http://{DIFY_HOST}:{DIFY_PORT}")
+
+app = FastAPI(title="学生成绩查询系统")
+
+# CORS
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 
-class ProxyHandler(SimpleHTTPRequestHandler):
+# ============================================================
+# Dify 流式代理 API
+# ============================================================
 
-    def do_GET(self):
-        if self.path == "/api/chat":
-            self.send_json({"error": "请使用 POST 请求"}, 405)
-        else:
-            super().do_GET()
+@app.post("/api/chat")
+async def chat(request: Request):
+    body = await request.json()
+    query = body.get("query", "").strip()
+    conversation_id = body.get("conversation_id", "")
 
-    def do_POST(self):
-        if self.path == "/api/chat":
-            self.handle_chat()
-        else:
-            self.send_json({"error": "Not Found"}, 404)
+    if not query:
+        return JSONResponse({"error": "请输入查询内容"}, status_code=400)
 
-    def handle_chat(self):
-        content_length = int(self.headers.get("Content-Length", 0))
-        body_bytes = self.rfile.read(content_length)
-        try:
-            data = json.loads(body_bytes.decode("utf-8"))
-        except (json.JSONDecodeError, UnicodeDecodeError):
-            self.send_json({"error": "无效的 JSON"}, 400)
-            return
+    payload = {
+        "inputs": {},
+        "query": query,
+        "user": "web-user",
+        "response_mode": "streaming",
+        "conversation_id": conversation_id,
+    }
 
-        query = data.get("query", "").strip()
-        if not query:
-            self.send_json({"error": "请输入查询内容"}, 400)
-            return
+    async def event_stream():
+        answer_parts = []
+        new_conv_id = conversation_id
 
-        conversation_id = data.get("conversation_id", "")
-
-        payload = json.dumps({
-            "inputs": {},
-            "query": query,
-            "user": "web-user",
-            "response_mode": "streaming",
-            "conversation_id": conversation_id,
-        })
-
-        conn = http.client.HTTPConnection(DIFY_HOST, DIFY_PORT, timeout=120)
-        try:
-            conn.request(
-                "POST",
-                "/v1/chat-messages",
-                body=payload,
-                headers={
-                    "Authorization": f"Bearer {DIFY_API_KEY}",
-                    "Content-Type": "application/json",
-                },
-            )
-            dify_response = conn.getresponse()
-
-            # ---- 流式头 ----
-            self.send_response(200)
-            self.send_header("Content-Type", "text/event-stream")
-            self.send_header("Cache-Control", "no-cache")
-            self.send_header("Access-Control-Allow-Origin", "*")
-            self.end_headers()
-
-            # ---- 逐行读取 Dify SSE 并过滤转发 ----
-            new_conv_id = conversation_id
-            answer_parts = []
-
-            for raw_line in dify_response:
-                line = raw_line.decode("utf-8", errors="replace").strip()
-                if not line.startswith("data: "):
-                    continue
-
-                try:
-                    evt = json.loads(line[6:])
-                except json.JSONDecodeError:
-                    continue
-
-                et = evt.get("event", "")
-
-                if et == "message":
-                    ans = evt.get("answer", "")
-                    if ans:
-                        answer_parts.append(ans)
-                        full_so_far = "".join(answer_parts)
-                        forward = json.dumps({
-                            "event": "message",
-                            "answer": full_so_far,
-                        }, ensure_ascii=False)
-                        self.wfile.write(f"data: {forward}\n\n".encode("utf-8"))
-                        self.wfile.flush()
-
-                elif et == "message_end":
-                    if evt.get("conversation_id"):
-                        new_conv_id = evt["conversation_id"]
-                    forward = json.dumps({
-                        "event": "message_end",
-                        "conversation_id": new_conv_id,
-                    }, ensure_ascii=False)
-                    self.wfile.write(f"data: {forward}\n\n".encode("utf-8"))
-                    self.wfile.flush()
-
-                elif et == "workflow_finished":
-                    outputs = evt.get("data", {}).get("outputs", {})
-                    if outputs and outputs.get("answer"):
-                        complete = outputs["answer"]
-                        forward = json.dumps({
-                            "event": "message",
-                            "answer": complete,
-                            "_final": True,
-                        }, ensure_ascii=False)
-                        self.wfile.write(f"data: {forward}\n\n".encode("utf-8"))
-                        self.wfile.flush()
-
-                elif et == "error":
-                    forward = json.dumps({
-                        "event": "error",
-                        "message": evt.get("message", "未知错误"),
-                    }, ensure_ascii=False)
-                    self.wfile.write(f"data: {forward}\n\n".encode("utf-8"))
-                    self.wfile.flush()
-
-        except ConnectionError:
-            pass
-        except Exception as e:
+        async with httpx.AsyncClient(timeout=120.0) as client:
             try:
-                self.send_json({"error": f"请求失败: {str(e)}"}, 500)
-            except ConnectionError:
-                pass
-        finally:
-            conn.close()
+                async with client.stream(
+                    "POST",
+                    f"{DIFY_BASE}/v1/chat-messages",
+                    json=payload,
+                    headers={"Authorization": f"Bearer {DIFY_API_KEY}"},
+                ) as resp:
+                    async for line in resp.aiter_lines():
+                        line = line.strip()
+                        if not line.startswith("data: "):
+                            continue
 
-    def send_json(self, obj, status=200):
-        self.send_response(status)
-        self.send_header("Content-Type", "application/json; charset=utf-8")
-        self.send_header("Access-Control-Allow-Origin", "*")
-        self.end_headers()
-        self.wfile.write(json.dumps(obj, ensure_ascii=False).encode("utf-8"))
+                        try:
+                            evt = json.loads(line[6:])
+                        except json.JSONDecodeError:
+                            continue
 
-    def log_message(self, fmt, *args):
-        print(f"  [{self.log_date_time_string()}] {args[0]} {args[1]}")
+                        et = evt.get("event", "")
 
+                        if et == "message":
+                            ans = evt.get("answer", "")
+                            if ans:
+                                answer_parts.append(ans)
+                                full = "".join(answer_parts)
+                                yield f"data: {json.dumps({'event': 'message', 'answer': full}, ensure_ascii=False)}\n\n"
+
+                        elif et == "message_end":
+                            if evt.get("conversation_id"):
+                                new_conv_id = evt["conversation_id"]
+                            yield f"data: {json.dumps({'event': 'message_end', 'conversation_id': new_conv_id}, ensure_ascii=False)}\n\n"
+
+                        elif et == "workflow_finished":
+                            outputs = evt.get("data", {}).get("outputs", {})
+                            if outputs and outputs.get("answer"):
+                                yield f"data: {json.dumps({'event': 'message', 'answer': outputs['answer'], '_final': True}, ensure_ascii=False)}\n\n"
+
+                        elif et == "error":
+                            yield f"data: {json.dumps({'event': 'error', 'message': evt.get('message', '未知错误')}, ensure_ascii=False)}\n\n"
+
+            except Exception as e:
+                yield f"data: {json.dumps({'event': 'error', 'message': str(e)}, ensure_ascii=False)}\n\n"
+
+    return StreamingResponse(
+        event_stream(),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "Access-Control-Allow-Origin": "*"},
+    )
+
+
+# ============================================================
+# 静态文件服务（API 路由之后注册，避免覆盖）
+# ============================================================
+
+@app.get("/")
+async def index():
+    return FileResponse(str(BASE_DIR / "index.html"))
+
+
+@app.get("/{filename:path}")
+async def static_files(filename: str):
+    file_path = BASE_DIR / filename
+    if file_path.is_file():
+        return FileResponse(str(file_path))
+    # 如果是目录/子路径，尝试 index.html
+    index_path = file_path / "index.html"
+    if index_path.is_file():
+        return FileResponse(str(index_path))
+    return JSONResponse({"error": "Not Found"}, status_code=404)
+
+
+# ============================================================
+# 启动
+# ============================================================
 
 if __name__ == "__main__":
+    import uvicorn
     print("=" * 48)
-    print("  学生成绩查询系统 — 流式代理")
+    print("  学生成绩查询系统 — FastAPI")
     print("=" * 48)
-
-    os.chdir(BASE_DIR)
-    httpd = HTTPServer(("0.0.0.0", PORT), ProxyHandler)
-
-    print(f"\n服务器已启动")
-    print(f"  地址: http://localhost:{PORT}")
+    print(f"\n  地址: http://localhost:{PORT}")
+    print(f"\n  ngrok 穿透: ngrok http {PORT}")
     print(f"\n按 Ctrl+C 停止\n")
 
-    try:
-        httpd.serve_forever()
-    except KeyboardInterrupt:
-        print("\n正在停止...")
-        httpd.server_close()
+    uvicorn.run(app, host="0.0.0.0", port=PORT, log_level="info")
